@@ -28,6 +28,7 @@
 #include "nlohmann/json.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <ctime>
@@ -39,6 +40,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 using json = nlohmann::json;
@@ -84,6 +86,7 @@ static void print_usage(const char * argv0) {
             "  --mmap / --no-mmap         legacy aliases for load-mode mmap / none\n"
             "  --mlock                   legacy alias for load-mode mlock\n"
             "  --timeout, -to N          HTTP read/write timeout seconds (default 1800)\n"
+            "  --sleep-idle-seconds N    unload the model from VRAM after N seconds idle; -1 disables (default -1)\n"
             "  --threads-http N          HTTP worker threads; <=0 = automatic\n"
             "  --device, -dev NAME       one offload device, e.g. CUDA0; none = CPU\n"
             "  --list-devices            list available offload devices and exit\n"
@@ -1875,118 +1878,210 @@ int main(int argc, char ** argv) {
         llama_kvmem_set_params(&st.kparams);
     }
 
-    llama_model_params mparams = llama_model_default_params();
-    mparams.n_gpu_layers = ngl;
-    mparams.load_mtp = st.spec_mtp;
-    mparams.load_mode = options.load_mode;
-    try {
-        device_config.apply(options, mparams);
-    } catch (const std::exception & e) {
-        fprintf(stderr, "invalid GPU configuration: %s\n", e.what());
-        return 1;
-    }
-    // Check resources before spending time/VRAM on loading model weights.
-    auto readable = [](const std::string & path) {
-        std::error_code ec;
-        return std::filesystem::is_regular_file(path, ec) && std::ifstream(path, std::ios::binary).good();
-    };
-    if (!readable(model_path)) {
-        fprintf(stderr, "KVMEM_STARTUP_ERROR failed to load model: --model file is missing or unreadable: %s\n", model_path.c_str());
-        return 1;
-    }
-    if (!mmproj_path.empty() && !readable(mmproj_path)) {
-        fprintf(stderr, "KVMEM_STARTUP_ERROR --mmproj file is missing or unreadable: %s\n", mmproj_path.c_str());
-        return 1;
-    }
-    if (!no_ui && !ui_dir.empty() && !readable((std::filesystem::path(ui_dir) / "index.html").string())) {
-        fprintf(stderr, "KVMEM_STARTUP_ERROR --ui-dir/--path must contain a readable index.html\n");
-        return 1;
-    }
-    json startup = {
-        {"model", model_path}, {"alias", st.model_name},
-        {"gpu", {{"device_requested", options.device_names.empty() ? "auto" : options.device_names},
-                  {"main_gpu", mparams.main_gpu}, {"split_mode", mparams.split_mode == LLAMA_SPLIT_MODE_NONE ? "none" : "layer"},
-                  {"layers_requested", ngl}}},
-        {"context_requested", n_ctx}, {"batch_requested", st.n_batch},
-        {"n_predict", st.n_predict_default},
-        {"kv", {{"k", ggml_type_name(st.cache_type_k)}, {"v", ggml_type_name(st.cache_type_v)}}},
-        {"kvmem", {{"enabled", st.kparams.enabled}, {"budget", st.kparams.budget}, {"gen_reserve", st.kparams.gen_reserve},
-                   {"sink_tokens", st.kparams.sink_tokens}, {"block_tokens", st.kparams.block_tokens}}},
-        {"spec_type", st.spec_mtp ? "draft-mtp" : "none"},
-        {"vision", {{"enabled", !mmproj_path.empty()}, {"projector", mmproj_path}, {"gpu", mmproj_gpu}}},
-        {"http", {{"host", host}, {"port", port}, {"timeout", options.timeout}, {"slots", 1}}},
-        {"auth", {{"enabled", !options.api_keys.empty()}, {"key_count", options.api_keys.size()}}},
-        {"sources", config_sources}, {"unlisted_sources", "default"}
-    };
-    kvmem_diag("KVMEM_STARTUP requested=%s\n", startup.dump(-1, ' ', false, json::error_handler_t::replace).c_str());
-    LOG_INF("srv    loading model %s\n", model_path.c_str());
-    st.model = llama_model_load_from_file(model_path.c_str(), mparams);
-    if (!st.model) {
-        fprintf(stderr, "failed to load model\n");
-        return 1;
-    }
-    st.vocab = llama_model_get_vocab(st.model);
-    try {
-        st.tmpls = common_chat_templates_init(st.model, chat_template);
-    } catch (const std::exception & e) {
-        fprintf(stderr, "invalid chat template: %s\n", e.what());
-        return 1;
-    }
-
-    llama_context_params cparams = llama_context_default_params();
-    cparams.n_ctx = (uint32_t) n_ctx;
-    cparams.n_batch = (uint32_t) st.n_batch;
-    cparams.n_ubatch = options.ubatch > 0 ? options.ubatch : st.n_batch;
-    if (options.threads > 0) cparams.n_threads = options.threads;
-    if (options.threads_batch > 0) cparams.n_threads_batch = options.threads_batch;
-    else if (options.threads > 0) cparams.n_threads_batch = options.threads;
-    if (options.flash_attn_set) cparams.flash_attn_type = options.flash_attn;
-    cparams.n_seq_max = 1;
-    cparams.type_k = st.cache_type_k;
-    cparams.type_v = st.cache_type_v;
-    if (st.spec_mtp) {
-        const uint32_t n_out = (uint32_t) (1 + std::max(0, st.spec_n_max));
-        cparams.n_outputs_max = n_out;
-        cparams.n_outputs_max_per_seq = n_out;
-        cparams.n_rs_seq = (uint32_t) std::max(0, st.spec_n_max);
-    }
-    st.ctx = llama_init_from_model(st.model, cparams);
-    if (!st.ctx) {
-        fprintf(stderr, "KVMEM_STARTUP_ERROR failed to create context; check --ctx-size, KV types, --flash-attn and available memory\n");
-        return 1;
-    }
-    kvmem_diag("KVMEM_CONTEXT target threads=%d threads_batch=%d ubatch=%u flash_attn_requested=%s\n",
-            llama_n_threads(st.ctx), llama_n_threads_batch(st.ctx), llama_n_ubatch(st.ctx),
-            llama_flash_attn_type_name(cparams.flash_attn_type));
-    if (st.spec_mtp) {
-        kvmem_spec_opts sopts;
-        sopts.n_max = st.spec_n_max;
-        sopts.p_min = st.spec_p_min;
-        sopts.n_gpu_layers = ngl;
-        sopts.n_ctx = n_ctx;
-        sopts.n_batch = st.n_batch;
-        sopts.n_ubatch = cparams.n_ubatch;
-        sopts.n_threads = options.threads;
-        sopts.n_threads_batch = options.threads_batch > 0 ? options.threads_batch : options.threads;
-        if (options.flash_attn_set) sopts.flash_attn = options.flash_attn;
-        sopts.kvmem_enabled = st.kparams.enabled;
-        sopts.type_k = st.cache_type_k;
-        sopts.type_v = st.cache_type_v;
-        sopts.draft_type = st.spec_cache_type;
-        if (!kvmem_spec_start(st.spec, st.model, st.ctx, sopts)) {
-            return 1;
-        }
-    }
-
-    if (!mmproj_path.empty()) {
+    // Model-runtime constructor: loads weights, chat templates, context, MTP
+    // spec and vision into the server state. Reusable so the model can be
+    // fully unloaded after an idle timeout and reloaded on the next request
+    // (--sleep-idle-seconds, upstream llama-server behaviour).
+    json startup_diag = json::object();
+    bool first_load = true;
+    std::function<bool()> load_runtime = [&]() -> bool {
+        llama_model_params mparams = llama_model_default_params();
+        mparams.n_gpu_layers = ngl;
+        mparams.load_mtp = st.spec_mtp;
+        mparams.load_mode = options.load_mode;
         try {
-            if (image_min_tokens > 0 && image_max_tokens > 0 && image_min_tokens > image_max_tokens)
-                throw std::invalid_argument("image-min-tokens exceeds image-max-tokens");
-            st.vision = std::make_unique<kvmem_vision>(st.model, mmproj_path, mmproj_gpu, image_min_tokens, image_max_tokens);
+            device_config.apply(options, mparams);
         } catch (const std::exception & e) {
-            fprintf(stderr, "%s\n", e.what());
-            return 1;
+            fprintf(stderr, "invalid GPU configuration: %s\n", e.what());
+            return false;
         }
+        // ablation: on reload the model file must still be there, same as startup.
+        auto readable = [](const std::string & path) {
+            std::error_code ec;
+            return std::filesystem::is_regular_file(path, ec) && std::ifstream(path, std::ios::binary).good();
+        };
+        if (!readable(model_path)) {
+            fprintf(stderr, "KVMEM_STARTUP_ERROR failed to load model: --model file is missing or unreadable: %s\n", model_path.c_str());
+            return false;
+        }
+        if (!mmproj_path.empty() && !readable(mmproj_path)) {
+            fprintf(stderr, "KVMEM_STARTUP_ERROR --mmproj file is missing or unreadable: %s\n", mmproj_path.c_str());
+            return false;
+        }
+        if (first_load) {
+            startup_diag = {
+                {"model", model_path}, {"alias", st.model_name},
+                {"gpu", {{"device_requested", options.device_names.empty() ? "auto" : options.device_names},
+                          {"main_gpu", mparams.main_gpu}, {"split_mode", mparams.split_mode == LLAMA_SPLIT_MODE_NONE ? "none" : "layer"},
+                          {"layers_requested", ngl}}},
+                {"context_requested", n_ctx}, {"batch_requested", st.n_batch},
+                {"n_predict", st.n_predict_default},
+                {"kv", {{"k", ggml_type_name(st.cache_type_k)}, {"v", ggml_type_name(st.cache_type_v)}}},
+                {"kvmem", {{"enabled", st.kparams.enabled}, {"budget", st.kparams.budget}, {"gen_reserve", st.kparams.gen_reserve},
+                           {"sink_tokens", st.kparams.sink_tokens}, {"block_tokens", st.kparams.block_tokens}}},
+                {"spec_type", st.spec_mtp ? "draft-mtp" : "none"},
+                {"vision", {{"enabled", !mmproj_path.empty()}, {"projector", mmproj_path}, {"gpu", mmproj_gpu}}},
+                {"http", {{"host", host}, {"port", port}, {"timeout", options.timeout}, {"slots", 1}}},
+                {"auth", {{"enabled", !options.api_keys.empty()}, {"key_count", options.api_keys.size()}}},
+                {"sources", config_sources}, {"unlisted_sources", "default"}
+            };
+            kvmem_diag("KVMEM_STARTUP requested=%s\n", startup_diag.dump(-1, ' ', false, json::error_handler_t::replace).c_str());
+            LOG_INF("srv    loading model %s\n", model_path.c_str());
+        }
+        st.model = llama_model_load_from_file(model_path.c_str(), mparams);
+        if (!st.model) {
+            fprintf(stderr, "failed to load model\n");
+            return false;
+        }
+        st.vocab = llama_model_get_vocab(st.model);
+        try {
+            st.tmpls = common_chat_templates_init(st.model, chat_template);
+        } catch (const std::exception & e) {
+            fprintf(stderr, "invalid chat template: %s\n", e.what());
+            llama_model_free(st.model);
+            st.model = nullptr;
+            st.vocab = nullptr;
+            return false;
+        }
+
+        llama_context_params cparams = llama_context_default_params();
+        cparams.n_ctx = (uint32_t) n_ctx;
+        cparams.n_batch = (uint32_t) st.n_batch;
+        cparams.n_ubatch = options.ubatch > 0 ? options.ubatch : st.n_batch;
+        if (options.threads > 0) cparams.n_threads = options.threads;
+        if (options.threads_batch > 0) cparams.n_threads_batch = options.threads_batch;
+        else if (options.threads > 0) cparams.n_threads_batch = options.threads;
+        if (options.flash_attn_set) cparams.flash_attn_type = options.flash_attn;
+        cparams.n_seq_max = 1;
+        cparams.type_k = st.cache_type_k;
+        cparams.type_v = st.cache_type_v;
+        if (st.spec_mtp) {
+            const uint32_t n_out = (uint32_t) (1 + std::max(0, st.spec_n_max));
+            cparams.n_outputs_max = n_out;
+            cparams.n_outputs_max_per_seq = n_out;
+            cparams.n_rs_seq = (uint32_t) std::max(0, st.spec_n_max);
+        }
+        st.ctx = llama_init_from_model(st.model, cparams);
+        if (!st.ctx) {
+            fprintf(stderr, "KVMEM_STARTUP_ERROR failed to create context; check --ctx-size, KV types, --flash-attn and available memory\n");
+            llama_model_free(st.model);
+            st.model = nullptr;
+            st.vocab = nullptr;
+            st.tmpls.reset();
+            return false;
+        }
+        kvmem_diag("KVMEM_CONTEXT target threads=%d threads_batch=%d ubatch=%u flash_attn_requested=%s\n",
+                llama_n_threads(st.ctx), llama_n_threads_batch(st.ctx), llama_n_ubatch(st.ctx),
+                llama_flash_attn_type_name(cparams.flash_attn_type));
+        if (st.spec_mtp) {
+            kvmem_spec_opts sopts;
+            sopts.n_max = st.spec_n_max;
+            sopts.p_min = st.spec_p_min;
+            sopts.n_gpu_layers = ngl;
+            sopts.n_ctx = n_ctx;
+            sopts.n_batch = st.n_batch;
+            sopts.n_ubatch = cparams.n_ubatch;
+            sopts.n_threads = options.threads;
+            sopts.n_threads_batch = options.threads_batch > 0 ? options.threads_batch : options.threads;
+            if (options.flash_attn_set) sopts.flash_attn = options.flash_attn;
+            sopts.kvmem_enabled = st.kparams.enabled;
+            sopts.type_k = st.cache_type_k;
+            sopts.type_v = st.cache_type_v;
+            sopts.draft_type = st.spec_cache_type;
+            if (!kvmem_spec_start(st.spec, st.model, st.ctx, sopts)) {
+                goto load_fail;
+            }
+        }
+
+        if (!mmproj_path.empty()) {
+            try {
+                if (image_min_tokens > 0 && image_max_tokens > 0 && image_min_tokens > image_max_tokens)
+                    throw std::invalid_argument("image-min-tokens exceeds image-max-tokens");
+                st.vision = std::make_unique<kvmem_vision>(st.model, mmproj_path, mmproj_gpu, image_min_tokens, image_max_tokens);
+            } catch (const std::exception & e) {
+                fprintf(stderr, "%s\n", e.what());
+                goto load_fail;
+            }
+        }
+        if (first_load) {
+            startup_diag["context_actual"] = llama_n_ctx(st.ctx);
+            startup_diag["batch_actual"] = llama_n_batch(st.ctx);
+            startup_diag["ubatch_actual"] = llama_n_ubatch(st.ctx);
+            startup_diag["threads_actual"] = llama_n_threads(st.ctx);
+            startup_diag["threads_batch_actual"] = llama_n_threads_batch(st.ctx);
+            startup_diag["flash_attn_requested"] = llama_flash_attn_type_name(cparams.flash_attn_type);
+        }
+        first_load = false;
+        return true;
+
+    load_fail:
+        kvmem_spec_stop(st.spec);
+        st.vision.reset();
+        llama_free(st.ctx);
+        st.ctx = nullptr;
+        llama_model_free(st.model);
+        st.model = nullptr;
+        st.vocab = nullptr;
+        st.tmpls.reset();
+        return false;
+    };
+
+    if (!load_runtime()) {
+        return 1;
+    }
+
+    // --sleep-idle-seconds: unload the model runtime (weights + context + vision)
+    // from VRAM after N seconds without a request, reload on the next request.
+    // Mirrors upstream llama-server's idle sleep without needing its dispatcher.
+    const int sleep_idle_seconds = options.sleep_idle_seconds;
+    std::atomic<bool> sleeping{false};   // model currently unloaded
+    std::atomic<bool> sleep_wake{false}; // a request is reloading right now
+    std::chrono::steady_clock::time_point last_activity = std::chrono::steady_clock::now();
+    std::atomic<bool> stop_monitor{false};
+
+    auto unload_runtime = [&]() {
+        kvmem_spec_stop(st.spec);
+        st.vision.reset();
+        // Reset KVMem/retrieval caches so a stale context is never reused.
+        st.cached_tokens.clear();
+        st.cached_prompt.reset();
+        st.active_prompt.reset();
+        st.mm_checkpoints.clear();
+        st.mm_rollback.reset();
+        st.mm_rollback_prompt.reset();
+        st.mm_live_checkpoint.reset();
+        st.gdn_ckpt.clear();
+        st.gdn_carry.clear();
+        st.gdn_query_carry.clear();
+        st.gdn_ckpt.clear();
+        st.gdn_ckpt_pos = -1;
+        st.gdn_ckpt_query.clear();
+        st.gdn_ckpt_query_pos = -1;
+        st.mm_committed = true;
+        if (st.ctx) { llama_free(st.ctx); st.ctx = nullptr; }
+        if (st.model) { llama_model_free(st.model); st.model = nullptr; }
+        st.vocab = nullptr;
+        st.tmpls.reset();
+    };
+
+    std::thread idle_monitor;
+    if (sleep_idle_seconds > 0) {
+        idle_monitor = std::thread([&]() {
+            while (!stop_monitor.load(std::memory_order_relaxed)) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                if (sleeping.load(std::memory_order_relaxed)) continue;
+                std::lock_guard<std::mutex> lk(st.mu);
+                if (sleeping.load(std::memory_order_relaxed) || sleep_wake.load(std::memory_order_relaxed)) continue;
+                if (!st.ctx) continue; // not loaded (error path or already free)
+                const auto idle_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - last_activity).count();
+                if (idle_ms < sleep_idle_seconds * 1000LL) continue;
+                LOG_INF("srv    idle for %lld ms >= %d s: unloading model to free VRAM\n",
+                        (long long) idle_ms, sleep_idle_seconds);
+                unload_runtime();
+                sleeping.store(true, std::memory_order_relaxed);
+            }
+        });
     }
 
     httplib::Server svr;
@@ -2013,20 +2108,6 @@ int main(int argc, char ** argv) {
     kvmem_install_auth(svr, options.api_keys, std::move(ui_paths));
     const int generation_limit = st.kparams.enabled && st.kparams.gen_reserve > 0 ?
         std::min(n_ctx, (int) st.kparams.gen_reserve) : n_ctx;
-    startup["context_actual"] = llama_n_ctx(st.ctx);
-    startup["batch_actual"] = llama_n_batch(st.ctx);
-    startup["ubatch_actual"] = llama_n_ubatch(st.ctx);
-    startup["threads_actual"] = llama_n_threads(st.ctx);
-    startup["threads_batch_actual"] = llama_n_threads_batch(st.ctx);
-    startup["flash_attn_requested"] = llama_flash_attn_type_name(cparams.flash_attn_type);
-    startup["generation_limit"] = generation_limit;
-    startup["default_max_tokens"] = std::min(st.n_predict_default > 0 ? st.n_predict_default : generation_limit, generation_limit);
-    startup["http"]["threads"] = options.threads_http_set ?
-        (options.threads_http > 0 ? options.threads_http : std::max(5, static_cast<int>(std::thread::hardware_concurrency()) - 1)) :
-        static_cast<int>(CPPHTTPLIB_THREAD_POOL_COUNT);
-    if (!config_sources.contains("--threads-batch") && options.threads > 0)
-        startup["sources"]["--threads-batch"] = "inherited:--threads";
-    if (!config_sources.contains("--ubatch-size")) startup["sources"]["--ubatch-size"] = "inherited:--batch-size";
     json kwargs = json::object();
     for (const auto & item : st.template_kwargs) kwargs[item.first] = json::parse(item.second);
     const auto thinking_params = kvmem_ui_sampling(true, st.sampling_overrides);
@@ -2133,6 +2214,27 @@ int main(int argc, char ** argv) {
 
     auto handle_chat = [&](const httplib::Request & req, httplib::Response & res) {
         const std::time_t created = std::time(nullptr);
+        // Idle-sleep wake: any request counts as activity; if the model runtime
+        // was unloaded by --sleep-idle-seconds, reload it here, before anything
+        // above touches st.* model state. A reload takes a few seconds for a 27B
+        // GGUF; concurrent requests wait on st.mu, matching a busy-model-style
+        // serialisation.
+        if (sleep_idle_seconds > 0) {
+            std::lock_guard<std::mutex> wake_lk(st.mu);
+            last_activity = std::chrono::steady_clock::now();
+            if (sleeping.load(std::memory_order_relaxed)) {
+                sleep_wake.store(true, std::memory_order_relaxed);
+                LOG_INF("srv    request while model asleep: reloading model runtime\n");
+                bool ok = load_runtime();
+                sleep_wake.store(false, std::memory_order_relaxed);
+                if (!ok) {
+                    res.status = 503;
+                    res.set_content("{\"error\":\"model reload failed after idle sleep\"}", "application/json");
+                    return;
+                }
+                sleeping.store(false, std::memory_order_relaxed);
+            }
+        }
         json body;
         std::vector<std::vector<uint8_t>> media_files;
         try {
@@ -2740,7 +2842,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "KVMEM_STARTUP_ERROR cannot bind %s:%d; check --host/--port, permissions and port conflicts\n", host.c_str(), port);
         return 1;
     }
-    kvmem_diag("KVMEM_STARTUP ready=%s\n", startup.dump(-1, ' ', false, json::error_handler_t::replace).c_str());
+    kvmem_diag("KVMEM_STARTUP ready=%s\n", startup_diag.dump(-1, ' ', false, json::error_handler_t::replace).c_str());
     LOG_INF("srv    llama-kvmem-server listening on http://%s:%d  model=%s kvmem=%d method=%s n_ctx=%d spec=%s n_max=%d think=%d rbudget=%d qmax=%d\n",
             host.c_str(), port, st.model_name.c_str(), (int) st.kparams.enabled,
             st.kparams.method == 1 ? "retrieval" : "recency", n_ctx,
@@ -2748,11 +2850,17 @@ int main(int argc, char ** argv) {
             st.reasoning_budget_default, st.query_max_tokens);
     if (!svr.listen_after_bind()) {
         fprintf(stderr, "listen failed\n");
+        stop_monitor.store(true, std::memory_order_relaxed);
+        if (idle_monitor.joinable()) idle_monitor.join();
         return 1;
     }
+    // Stop the idle monitor before tearing the runtime down (must also run on
+    // the normal exit path after listen_after_bind() returns).
+    stop_monitor.store(true, std::memory_order_relaxed);
+    if (idle_monitor.joinable()) idle_monitor.join();
     st.vision.reset();
     kvmem_spec_stop(st.spec);
-    llama_free(st.ctx);
-    llama_model_free(st.model);
+    if (st.ctx) { llama_free(st.ctx); st.ctx = nullptr; }
+    if (st.model) { llama_model_free(st.model); st.model = nullptr; }
     return 0;
 }
