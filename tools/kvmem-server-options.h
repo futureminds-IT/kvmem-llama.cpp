@@ -80,6 +80,7 @@ struct kvmem_server_options {
     std::string alias;
     std::vector<std::string> api_keys;
     int timeout = 1800; // Preserve KVMem's long-request default.
+    int sleep_idle_seconds = -1; // -1 = idle sleep disabled (upstream llama-server default)
     int threads_http = -1;
     bool threads_http_set = false;
     bool list_devices = false;
@@ -179,6 +180,10 @@ struct kvmem_server_options {
             verbosity = kvmem_cli_int(arg.c_str(), need(arg.c_str()), 0, 5);
         } else if (arg == "-to" || arg == "--timeout") {
             timeout = kvmem_cli_int(arg.c_str(), need(arg.c_str()));
+        } else if (arg == "--sleep-idle-seconds") {
+            const int v = kvmem_cli_int(arg.c_str(), need(arg.c_str()), -1);
+            if (v == 0) throw std::invalid_argument("--sleep-idle-seconds requires -1 (disabled) or a positive number of seconds");
+            sleep_idle_seconds = v;
         } else if (arg == "--threads-http") {
             threads_http = kvmem_cli_int(arg.c_str(), need(arg.c_str()), std::numeric_limits<int>::min(),
                                        std::numeric_limits<int>::max() - 1024);
