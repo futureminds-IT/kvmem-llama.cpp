@@ -3132,6 +3132,17 @@ int main(int argc, char ** argv) {
                 sleep_wake.store(true, std::memory_order_relaxed);
                 LOG_INF("srv    request while model asleep: reloading model runtime\n");
                 bool ok = load_runtime();
+                // A reload can fail while another process still holds VRAM on
+                // this GPU: this host runs a second, smaller llama-server whose
+                // own sleep timer frees it after a few seconds. Retry for a
+                // bounded window instead of failing the request outright, so a
+                // wake rides out that contention rather than 503ing the client.
+                for (int waited = 0; !ok && waited < 60; waited += 5) {
+                    LOG_WRN("srv    model reload failed (GPU busy?); retry in 5s (%ds/60s)\n", waited + 5);
+                    std::this_thread::sleep_for(std::chrono::seconds(5));
+                    last_activity = std::chrono::steady_clock::now();
+                    ok = load_runtime();
+                }
                 sleep_wake.store(false, std::memory_order_relaxed);
                 if (!ok) {
                     res.status = 503;
