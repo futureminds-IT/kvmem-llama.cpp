@@ -1,0 +1,45 @@
+--- a/tools/llama-kvmem-server.cpp
++++ b/tools/llama-kvmem-server.cpp
+@@ -2866,8 +2866,12 @@
+         kvmem_spec_stop(st.spec);
+         st.vision.reset();
+         // Reset KVMem/retrieval and generation caches so a stale context is
+-        // never reused after a wake; the persistent conversation stores and
+-        // their NVMe spill are retained across sleep by design.
++        // never reused after a wake. The multi-conversation host stores cannot
++        // survive this either: the adapter is rebuilt with the model, so their
++        // handles dangle and st.conv_active can never again equal
++        // llama_kvmem_store_current(). They are dropped below, after the model
++        // is gone (a wake therefore starts as a cache miss, exactly like
++        // upstream llama-server's sleep, which also loses all context).
+         st.cached_tokens.clear();
+         st.cached_prompt.reset();
+         st.active_prompt.reset();
+@@ -2895,6 +2899,27 @@
+         if (st.model) { llama_model_free(st.model); st.model = nullptr; }
+         st.vocab = nullptr;
+         st.tmpls.reset();
++        // --kvmem-conversations: release the host stores and their disk
++        // snapshots for good. Only the bookkeeping is dropped; the adapter's
++        // own stores died with the context above, and a stale store_id would
++        // otherwise make session_begin_request throw "session switch requires
++        // a committed active conversation" on every request after a wake.
++        if (st.conv_limits.max_stores > 1) {
++            const int dropped = st.conv_table.count();
++            if (st.session_files) {
++                for (const auto & held : st.conv_table.entries()) {
++                    if (!st.session_files->erase(held.id)) {
++                        LOG_WRN("srv    KVMEM sleep: cannot remove session snapshot id=%d\n", held.id);
++                    }
++                }
++            }
++            st.conv_table = kvmem_store_table();
++            st.conv.clear();
++            st.conv_active = -1;
++            if (dropped > 0) {
++                LOG_INF("srv    sleep: dropped %d conversation store(s); next request starts cold\n", dropped);
++            }
++        }
+     };
+ 
+     std::thread idle_monitor;
