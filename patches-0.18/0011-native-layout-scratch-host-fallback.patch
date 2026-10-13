@@ -1,0 +1,56 @@
+Subject: [PATCH] kvmem: fall back to the host path when the layout scratch does not fit (v0.17 behaviour)
+
+v0.18 made the retrieval layout scratch mandatory:
+
+    if (cudaMalloc(&transfer->layout, selected.size() * block_tokens * (krow + vrow)) != cudaSuccess)
+        throw MemoryError(BudgetExceeded, "native layout scratch unavailable");
+
+One device scratch block per selected block means several GiB for a long prompt
+(~2 GB at ~58k tokens, ~3 GB at ~68k). On a 16 GB card with the model and the KV
+pool resident there is no such free memory, so every long request failed with
+HTTP 500 - the same requests that v0.17 served by falling back to the per-tensor
+host path (`layout scratch cudaMalloc failed, host fallback`).
+
+Keep the device scratch as the fast path but do not require it: on failure log a
+warning and leave transfer->layout / transfer->mtp_layout null. The existing
+consumers already handle that - apply_native_selection() retries the allocation
+with the resident block count and otherwise uses its per-tensor host path, and
+llama_memory_kvmem_mtp::layout_d2d() returns false so the caller restores those
+blocks from raw-KV.
+
+Apply after 0010. Verified on the RTX 5060 Ti (27B IQ3_S, budget 36864 +
+gen_reserve 16384, guard limit 79872): 58562 prompt tokens -> HTTP 200 in 89 s
+and 68662 -> HTTP 200 in 21 s, with "MTP layout scratch cudaMalloc failed (288
+blocks), host fallback" in the log. Before the patch both returned HTTP 500.
+diff --git a/src/adapter/llama-memory-kvmem.cpp b/src/adapter/llama-memory-kvmem.cpp
+index aa84d27..efe3d80 100644
+--- a/src/adapter/llama-memory-kvmem.cpp
++++ b/src/adapter/llama-memory-kvmem.cpp
+@@ -5864,13 +5864,25 @@ std::unique_ptr<kvmem::MemoryTransfer> llama_memory_kvmem::NativeBackend::prepar
+     if (purpose == NativePurpose::Retrieval && !selected.empty()) {
+         const size_t bytes = selected.size() * o.block_tokens_ *
+                 (ggml_row_size(o.type_k_, o.n_embd_k_) + ggml_row_size(o.type_v_, o.n_embd_v_));
++        // A retrieval transfer wants one device layout scratch per selected block,
++        // which for a long prompt is several GiB - more than a 16 GB card has free
++        // once the model and the KV pool are resident. v0.17 fell back to the
++        // per-tensor host path in that case; v0.18 made the allocation mandatory and
++        // failed the whole request with HTTP 500 ("native layout scratch
++        // unavailable"). Keep the device scratch as the fast path, but leave the
++        // pointers null when it does not fit: apply_native_selection() and the MTP
++        // replay then take their own host fallback (see the layout_d2d callers).
+         if (cudaMalloc(reinterpret_cast<void **>(&transfer->layout), bytes) != cudaSuccess) {
+             (void) cudaGetLastError();
+-            throw kvmem::MemoryError(kvmem::MemoryErrorCode::BudgetExceeded, "native layout scratch unavailable");
++            transfer->layout = nullptr;
++            LLAMA_LOG_WARN("%s: layout scratch cudaMalloc failed (%zu bytes for %zu blocks), host fallback\n",
++                           __func__, bytes, selected.size());
+         }
+         if (o.mtp_ && cudaMalloc(reinterpret_cast<void **>(&transfer->mtp_layout), o.mtp_->layout_scratch_bytes(selected.size())) != cudaSuccess) {
+             (void) cudaGetLastError();
+-            throw kvmem::MemoryError(kvmem::MemoryErrorCode::BudgetExceeded, "native MTP layout scratch unavailable");
++            transfer->mtp_layout = nullptr;
++            LLAMA_LOG_WARN("%s: MTP layout scratch cudaMalloc failed (%zu blocks), host fallback\n",
++                           __func__, selected.size());
+         }
+     }
+     if (o.native_probe_) o.native_probe_(o, kvmem::MemoryPhase::Prepared);
