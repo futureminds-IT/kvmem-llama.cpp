@@ -83,6 +83,9 @@ struct kvmem_server_options {
     std::string alias;
     std::vector<std::string> api_keys;
     int timeout = 1800; // Preserve KVMem's long-request default.
+    // Dirk feature: unload the model after N seconds without a request and
+    // reload it on the next one (frees VRAM for other CUDA users). 0 = off.
+    int sleep_idle_seconds = 0;
     int threads_http = -1;
     bool threads_http_set = false;
     bool list_devices = false;
@@ -184,6 +187,8 @@ struct kvmem_server_options {
             if (session_cache_dir.empty()) throw std::invalid_argument("session cache directory is empty");
         } else if (arg == "--kvmem-trace" || arg == "--no-kvmem-trace") {
             trace = arg == "--kvmem-trace" ? 1 : 0;
+        } else if (arg == "--sleep-idle-seconds") {
+            sleep_idle_seconds = kvmem_cli_int(arg.c_str(), need(arg.c_str()), 0);
         } else if (arg == "-lv" || arg == "--verbosity" || arg == "--log-verbosity") {
             verbosity = kvmem_cli_int(arg.c_str(), need(arg.c_str()), 0, 5);
         } else if (arg == "-to" || arg == "--timeout") {
