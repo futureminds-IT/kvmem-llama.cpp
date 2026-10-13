@@ -3101,15 +3101,31 @@ bool llama_memory_kvmem::d2h_submit(ggml_backend_t be) {
     if (bytes == 0) {
         return false;
     }
-    auto & s = d2h_->slots[d2h_->next];
+    // Slot selection (upstream issue #55, reimplemented here): pure round-robin
+    // lets both slots grow towards the high-water mark in turn, because the
+    // capture demand inside one request is a ladder (up to 224 MB for the
+    // record snapshot). Across two requests both slots then keep that size,
+    // i.e. 224 MB of VRAM plus 224 MB of pinned host memory held permanently
+    // even though no single request needs it. So: prefer the round-robin slot,
+    // but if it is too small and the other one is idle AND large enough, use
+    // that one instead. A submit still triggers at most one allocation (no
+    // shrinking at all, hence no allocation churn).
+    int chosen = d2h_->next;
+    if (d2h_->slots[chosen].cap < bytes) {
+        const int other = 1 - chosen;
+        if (!d2h_->slots[other].inflight && d2h_->slots[other].cap >= bytes) {
+            chosen = other;
+        }
+    }
+    auto & s = d2h_->slots[chosen];
     if (s.inflight) {
         if (harvest_worker_on()) {
             const int64_t tw = ggml_time_us();
-            harvest_wait_slot(d2h_->next);
+            harvest_wait_slot(chosen);
             perf_.last_commit_us = ggml_time_us() - tw;
             perf_.commit_us += perf_.last_commit_us;
         } else {
-            d2h_commit(d2h_->next);
+            d2h_commit(chosen);
         }
     }
     perf_.last_sync_us = 0;
@@ -3252,7 +3268,7 @@ bool llama_memory_kvmem::d2h_submit(ggml_backend_t be) {
     if (!kvmem_cuda_ok(cudaEventRecord(s.done, d2h_->stream), "record")) {
         return false;
     }
-    const int submitted = d2h_->next;
+    const int submitted = chosen;
     if (harvest_worker_on()) {
         {
             std::lock_guard<std::mutex> lk(harvest_w_->mu);
@@ -3272,7 +3288,7 @@ bool llama_memory_kvmem::d2h_submit(ggml_backend_t be) {
         kvmem_diag("KVMEM_TRACE harvest n=%zu q=%u k=%u v=%u host=%u gpu=%u bytes=%zu n_pos=%zu async=1 slot=%d\n",
                 s.items.size(), n_q, n_k, n_v, n_host, n_dev, off, s.pos.size(), submitted);
     }
-    d2h_->next = 1 - d2h_->next;
+    d2h_->next = 1 - chosen;  // invariant: 1 - next == last submitted slot
     return true;
 }
 
