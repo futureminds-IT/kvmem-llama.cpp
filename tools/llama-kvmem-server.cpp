@@ -1843,6 +1843,58 @@ int main(int argc, char ** argv) {
             res.set_content("{\"error\":\"prompt + max_tokens exceeds n_ctx\"}", "application/json");
             return;
         }
+        // KVMem pool guard (upstream issue #56, reimplemented here): the
+        // committed span (prompt + generation) has to fit into the GPU pool,
+        // i.e. into budget + gen_reserve cells (both aligned to block_tokens,
+        // identical to kvmem_compute_pool in the adapter). Without this check
+        // the commit path runs out of cells -> CUDA OOM -> ggml_abort and takes
+        // the WHOLE server down: every running client loses its state and the
+        // container restarts. A clean 400 is strictly better. The guard is
+        // deliberately conservative: with retrieval active, parts of the
+        // history live in host RAM, so a prompt above the pool may still be
+        // servable - that is the price for not killing the process.
+        if (st.kparams.enabled && st.ctx) {
+            const uint32_t blk = std::max(1u, st.kparams.block_tokens);
+            const auto align_blk = [blk](uint32_t t) {
+                return ((t + blk - 1u) / blk) * blk;
+            };
+            const uint32_t pool_budget = st.kparams.budget
+                ? align_blk(st.kparams.budget)
+                : align_blk((uint32_t) llama_n_ctx(st.ctx));
+            const uint32_t pool_reserve = align_blk(
+                st.kparams.gen_reserve ? st.kparams.gen_reserve : 256u);
+            const uint32_t pool_ceiling = pool_budget + pool_reserve;
+            // The pool ceiling is NOT a hard limit: with retrieval active, parts
+            // of the history live in host RAM, and measurements show requests up
+            // to ~130 % of the pool completing fine (radar run 2026-10-12: 56128
+            // and 68520 cells against 53248 - both runs still wrote a report).
+            // Only clearly larger overruns are hopeless. Hence a tolerance
+            // instead of the hard limit: reject only a large overrun instead of
+            // losing the process. Tunable via KVMEM_POOL_GUARD_MARGIN_PCT,
+            // 0 = guard effectively off.
+            uint32_t margin_pct = 150u;
+            if (const char * mg = std::getenv("KVMEM_POOL_GUARD_MARGIN_PCT")) {
+                if (*mg) {
+                    margin_pct = (uint32_t) std::strtoul(mg, nullptr, 10);
+                }
+            }
+            if (margin_pct == 0) {
+                margin_pct = 1;  // "off" means in practice: only gross outliers
+            } else if (margin_pct < 100u) {
+                margin_pct = 100u;  // never stricter than the pool itself
+            }
+            const uint64_t pool_limit = (uint64_t) pool_ceiling * margin_pct / 100u;
+            if ((uint64_t) toks.size() + (uint64_t) std::max(0, cr.max_tokens) > pool_limit) {
+                res.status = 400;
+                const std::string err = "prompt (" + std::to_string(toks.size()) +
+                    ") + max_tokens (" + std::to_string(cr.max_tokens) +
+                    ") exceeds KVMem GPU pool (" + std::to_string(pool_ceiling) +
+                    " cells, limit at " + std::to_string(margin_pct) + "% = " +
+                    std::to_string(pool_limit) + "). Shorten history or lower max_tokens.";
+                res.set_content(json{{"error", err}}.dump(), "application/json");
+                return;
+            }
+        }
         try {
             llama_driver_validate_capacity(st, *parsed_prompt, (int) toks.size());
         } catch (const std::exception & e) {
