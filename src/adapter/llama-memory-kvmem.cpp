@@ -5864,13 +5864,25 @@ std::unique_ptr<kvmem::MemoryTransfer> llama_memory_kvmem::NativeBackend::prepar
     if (purpose == NativePurpose::Retrieval && !selected.empty()) {
         const size_t bytes = selected.size() * o.block_tokens_ *
                 (ggml_row_size(o.type_k_, o.n_embd_k_) + ggml_row_size(o.type_v_, o.n_embd_v_));
+        // A retrieval transfer wants one device layout scratch per selected block,
+        // which for a long prompt is several GiB - more than a 16 GB card has free
+        // once the model and the KV pool are resident. v0.17 fell back to the
+        // per-tensor host path in that case; v0.18 made the allocation mandatory and
+        // failed the whole request with HTTP 500 ("native layout scratch
+        // unavailable"). Keep the device scratch as the fast path, but leave the
+        // pointers null when it does not fit: apply_native_selection() and the MTP
+        // replay then take their own host fallback (see the layout_d2d callers).
         if (cudaMalloc(reinterpret_cast<void **>(&transfer->layout), bytes) != cudaSuccess) {
             (void) cudaGetLastError();
-            throw kvmem::MemoryError(kvmem::MemoryErrorCode::BudgetExceeded, "native layout scratch unavailable");
+            transfer->layout = nullptr;
+            LLAMA_LOG_WARN("%s: layout scratch cudaMalloc failed (%zu bytes for %zu blocks), host fallback\n",
+                           __func__, bytes, selected.size());
         }
         if (o.mtp_ && cudaMalloc(reinterpret_cast<void **>(&transfer->mtp_layout), o.mtp_->layout_scratch_bytes(selected.size())) != cudaSuccess) {
             (void) cudaGetLastError();
-            throw kvmem::MemoryError(kvmem::MemoryErrorCode::BudgetExceeded, "native MTP layout scratch unavailable");
+            transfer->mtp_layout = nullptr;
+            LLAMA_LOG_WARN("%s: MTP layout scratch cudaMalloc failed (%zu blocks), host fallback\n",
+                           __func__, selected.size());
         }
     }
     if (o.native_probe_) o.native_probe_(o, kvmem::MemoryPhase::Prepared);
