@@ -1,0 +1,462 @@
+Subject: [PATCH] server: idle-sleep with wake reload (v0.17 series 0005/0006/0007 ported to v0.18)
+
+Port of the local v0.17 patches 0005/0006/0007 onto v0.18.0-llamacpp-rc1.
+
+Apply AFTER 0008 and 0009: on v0.18 the guard hunks live in
+tools/llama-kvmem-server.cpp, the same file this restructure rewrites.
+
+v0.18 moved the entire load path into main() (model, context, lanes,
+conversation arming) and introduced ServerState/LlamaEngineState with execution
+scopes, so the three concerns no longer split into independent hunks. This one
+patch carries all of them:
+
+  0005 --sleep-idle-seconds : unload model/context/vision after N seconds without
+                              a request, reload it on the next one.
+  0006 conversation stores  : drop the conversation table, host stores and disk
+                              snapshots on unload so no dangling handle survives
+                              the wake (the next request starts cold).
+  0007 wake retry           : retry the reload for up to 60 s (5 s steps) because
+                              other CUDA processes keep their VRAM until their own
+                              idle timer fires, and free a half-built runtime
+                              before retrying.
+
+Two v0.18-specific pitfalls are handled here; neither exists in the v0.17 series:
+
+  * main() holds `startup_execution` (a kvmem_execution_scope) for the whole
+    startup, so every adapter query during startup sees the execution state. The
+    wake path is an HTTP worker thread and must establish that scope itself,
+    otherwise llama_kvmem_store_swap_supported() answers for an empty execution
+    state, the conversation arming fails and the reload dies half way.
+  * the idle monitor and the request path must be serialized: the monitor holds
+    sleep_mu while it unloads, and the request takes the same lock before it
+    counts itself in. Without that an arriving request reads st.ctx/st.vision
+    while the monitor frees them (SIGSEGV on the second idle cycle).
+
+Verified on the RTX 5060 Ti with the 27B IQ3_S: 4 idle/wake cycles (45 s idle,
+including two ~58k-token requests) - VRAM 15050 -> 1074 MiB on unload, wake in
+~5 s with a correct completion, process alive after every cycle, no log errors.
+
+diff --git a/tools/kvmem-server-options.h b/tools/kvmem-server-options.h
+index d90bf6f..f333782 100644
+--- a/tools/kvmem-server-options.h
++++ b/tools/kvmem-server-options.h
+@@ -83,6 +83,9 @@ struct kvmem_server_options {
+     std::string alias;
+     std::vector<std::string> api_keys;
+     int timeout = 1800; // Preserve KVMem's long-request default.
++    // Dirk feature: unload the model after N seconds without a request and
++    // reload it on the next one (frees VRAM for other CUDA users). 0 = off.
++    int sleep_idle_seconds = 0;
+     int threads_http = -1;
+     bool threads_http_set = false;
+     bool list_devices = false;
+@@ -184,6 +187,8 @@ struct kvmem_server_options {
+             if (session_cache_dir.empty()) throw std::invalid_argument("session cache directory is empty");
+         } else if (arg == "--kvmem-trace" || arg == "--no-kvmem-trace") {
+             trace = arg == "--kvmem-trace" ? 1 : 0;
++        } else if (arg == "--sleep-idle-seconds") {
++            sleep_idle_seconds = kvmem_cli_int(arg.c_str(), need(arg.c_str()), 0);
+         } else if (arg == "-lv" || arg == "--verbosity" || arg == "--log-verbosity") {
+             verbosity = kvmem_cli_int(arg.c_str(), need(arg.c_str()), 0, 5);
+         } else if (arg == "-to" || arg == "--timeout") {
+diff --git a/tools/llama-kvmem-server.cpp b/tools/llama-kvmem-server.cpp
+index 74a480f..1b19cc1 100644
+--- a/tools/llama-kvmem-server.cpp
++++ b/tools/llama-kvmem-server.cpp
+@@ -1312,20 +1312,17 @@ int main(int argc, char ** argv) {
+         {"sources", config_sources}, {"unlisted_sources", "default"}
+     };
+     kvmem_diag("KVMEM_STARTUP requested=%s\n", startup.dump(-1, ' ', false, json::error_handler_t::replace).c_str());
+-    LOG_INF("srv    loading model %s\n", model_path.c_str());
+-    shared_model.reset(llama_model_load_from_file(model_path.c_str(), mparams));
+-    st.model = shared_model.get();
+-    if (!st.model) {
+-        fprintf(stderr, "failed to load model\n");
+-        return 1;
+-    }
+-    st.vocab = llama_model_get_vocab(st.model);
+-    try {
+-        st.tmpls = common_chat_templates_init(st.model, chat_template);
+-    } catch (const std::exception & e) {
+-        fprintf(stderr, "invalid chat template: %s\n", e.what());
+-        return 1;
+-    }
++    // ---- runtime load/unload (Dirk feature: --sleep-idle-seconds) ----------
++    // Everything that dies with the model lives in load_runtime(), so the idle
++    // monitor can free it and the next request can rebuild it. cparams and
++    // initialize_lane() below are captured by reference, so a wake restores the
++    // identical runtime.
++    common_chat_templates_ptr preparation_templates;
++    std::function<bool()> load_runtime;
++    std::function<void()> unload_runtime;
++    std::vector<std::unique_ptr<ServerState>> additional_lanes;
++    std::vector<ServerState *> lanes{&st};
++    kvmem_lane_pool lane_pool(options.parallel);
+ 
+     llama_context_params cparams = llama_context_default_params();
+     cparams.n_ctx = (uint32_t) n_ctx;
+@@ -1388,106 +1385,217 @@ int main(int argc, char ** argv) {
+         }
+         return true;
+     };
+-    if (!initialize_lane(st)) return 1;
+-    std::vector<std::unique_ptr<ServerState>> additional_lanes;
+-    std::vector<ServerState *> lanes{&st};
+-    for (int lane = 1; lane < options.parallel; ++lane) {
+-        auto next = std::make_unique<ServerState>();
+-        next->model = st.model;
+-        next->vocab = st.vocab;
+-        next->kparams = st.kparams;
+-        next->n_batch = st.n_batch;
+-        next->n_predict_default = st.n_predict_default;
+-        next->sampling_overrides = st.sampling_overrides;
+-        next->query_last_fallback = st.query_last_fallback;
+-        next->query_max_tokens = st.query_max_tokens;
+-        next->query_replay_auto = st.query_replay_auto;
+-        next->query_policy_user = st.query_policy_user;
+-        next->model_name = st.model_name;
+-        next->cache_type_k = st.cache_type_k;
+-        next->cache_type_v = st.cache_type_v;
+-        next->spec_cache_type = st.spec_cache_type;
+-        next->spec_mtp = st.spec_mtp;
+-        next->spec_n_max = st.spec_n_max;
+-        next->spec_p_min = st.spec_p_min;
+-        next->enable_thinking_default = st.enable_thinking_default;
+-        next->template_kwargs = st.template_kwargs;
+-        next->reasoning_budget_default = st.reasoning_budget_default;
+-        next->reasoning_budget_message = st.reasoning_budget_message;
+-        next->tmpls = common_chat_templates_init(st.model, chat_template);
+-        if (!initialize_lane(*next)) return 1;
+-        lanes.push_back(next.get());
+-        additional_lanes.push_back(std::move(next));
+-    }
+-    kvmem_lane_pool lane_pool(lanes.size());
+-    LOG_INF("srv    KVMEM lanes=%zu shared_model=1 context_per_lane=%d budget_per_lane=%u "
+-            "generation_reserve_per_lane=%u\n", lanes.size(), n_ctx, st.kparams.budget, st.kparams.gen_reserve);
+-
+-    if (!mmproj_path.empty()) {
++    load_runtime = [&]() -> bool {
++        // The startup path runs with main's `startup_execution` scope active.
++        // The wake path is an HTTP worker thread, so it has to establish the
++        // scope itself - otherwise adapter queries (for example the host-store
++        // swap capability checked by the conversation arming below) answer for
++        // an empty execution state and the reload fails half way.
++        kvmem_execution_scope scope(st.execution.get());
++        LOG_INF("srv    loading model %s\n", model_path.c_str());
++        shared_model.reset(llama_model_load_from_file(model_path.c_str(), mparams));
++        st.model = shared_model.get();
++        if (!st.model) {
++            fprintf(stderr, "failed to load model\n");
++            return false;
++        }
++        st.vocab = llama_model_get_vocab(st.model);
+         try {
+-            if (image_min_tokens > 0 && image_max_tokens > 0 && image_min_tokens > image_max_tokens)
+-                throw std::invalid_argument("image-min-tokens exceeds image-max-tokens");
+-            st.vision = std::make_shared<kvmem_vision>(
+-                    st.model, mmproj_path, mmproj_gpu, mmproj_device,
+-                    image_min_tokens, image_max_tokens, options.threads, video_fps);
++            st.tmpls = common_chat_templates_init(st.model, chat_template);
+         } catch (const std::exception & e) {
+-            fprintf(stderr, "%s\n", e.what());
+-            return 1;
++            fprintf(stderr, "invalid chat template: %s\n", e.what());
++            return false;
+         }
+-    }
+-
+-    // Arm the multi-conversation host stores only now: the adapter refuses the
+-    // swap in configurations it cannot drain back from host RAM, and flash
+-    // attention is resolved inside llama_init_from_model, not at parse time.
+-    if (options.parallel == 1 && options.conversations > 1) {
+-        if (!llama_kvmem_store_swap_supported()) {
+-            if (options.session_disk_bytes) {
+-                LOG_ERR("srv    KVMEM session disk cache requires supported session switching (flash attention on)\n");
+-                return 1;
++        if (!initialize_lane(st)) return false;
++        additional_lanes.clear();
++        lanes.assign(1, &st);
++        for (int lane = 1; lane < options.parallel; ++lane) {
++            auto next = std::make_unique<ServerState>();
++            next->model = st.model;
++            next->vocab = st.vocab;
++            next->kparams = st.kparams;
++            next->n_batch = st.n_batch;
++            next->n_predict_default = st.n_predict_default;
++            next->sampling_overrides = st.sampling_overrides;
++            next->query_last_fallback = st.query_last_fallback;
++            next->query_max_tokens = st.query_max_tokens;
++            next->query_replay_auto = st.query_replay_auto;
++            next->query_policy_user = st.query_policy_user;
++            next->model_name = st.model_name;
++            next->cache_type_k = st.cache_type_k;
++            next->cache_type_v = st.cache_type_v;
++            next->spec_cache_type = st.spec_cache_type;
++            next->spec_mtp = st.spec_mtp;
++            next->spec_n_max = st.spec_n_max;
++            next->spec_p_min = st.spec_p_min;
++            next->enable_thinking_default = st.enable_thinking_default;
++            next->template_kwargs = st.template_kwargs;
++            next->reasoning_budget_default = st.reasoning_budget_default;
++            next->reasoning_budget_message = st.reasoning_budget_message;
++            next->tmpls = common_chat_templates_init(st.model, chat_template);
++            if (!initialize_lane(*next)) return false;
++            lanes.push_back(next.get());
++            additional_lanes.push_back(std::move(next));
++        }
++        LOG_INF("srv    KVMEM lanes=%zu shared_model=1 context_per_lane=%d budget_per_lane=%u "
++                "generation_reserve_per_lane=%u\n", lanes.size(), n_ctx, st.kparams.budget, st.kparams.gen_reserve);
++
++        if (!mmproj_path.empty()) {
++            try {
++                if (image_min_tokens > 0 && image_max_tokens > 0 && image_min_tokens > image_max_tokens)
++                    throw std::invalid_argument("image-min-tokens exceeds image-max-tokens");
++                st.vision = std::make_shared<kvmem_vision>(
++                        st.model, mmproj_path, mmproj_gpu, mmproj_device,
++                        image_min_tokens, image_max_tokens, options.threads, video_fps);
++            } catch (const std::exception & e) {
++                fprintf(stderr, "%s\n", e.what());
++                return false;
+             }
+-            LOG_WRN("srv    KVMEM --kvmem-conversations %d unavailable in this configuration; "
+-                    "using one host store\n", options.conversations);
+-        } else {
+-            st.conv_limits.max_stores = options.conversations;
+-            st.conv_limits.max_bytes = options.conversation_bytes;
+-            if (options.session_disk_bytes || options.payload_disk_bytes) {
+-                try {
+-                    st.session_files = std::make_unique<kvmem_session_files>(
+-                        std::filesystem::u8path(options.payload_disk_bytes ? options.payload_disk_dir : options.session_cache_dir),
+-                        options.payload_disk_bytes ? options.payload_disk_bytes : options.session_disk_bytes,
+-                        [](bool warning, const std::string & message) {
+-                            if (warning) { LOG_WRN("srv    KVMEM session cache %s\n", message.c_str()); }
+-                            else { LOG_INF("srv    KVMEM session cache %s\n", message.c_str()); }
+-                        }, kvmem_execution_spill_file(st.execution.get()));
+-                } catch (const std::exception & e) {
+-                    LOG_ERR("srv    KVMEM session cache initialization failed: %s\n", e.what()); return 1;
++        }
++
++        // Arm the multi-conversation host stores only now: the adapter refuses the
++        // swap in configurations it cannot drain back from host RAM, and flash
++        // attention is resolved inside llama_init_from_model, not at parse time.
++        if (options.parallel == 1 && options.conversations > 1) {
++            if (!llama_kvmem_store_swap_supported()) {
++                if (options.session_disk_bytes) {
++                    LOG_ERR("srv    KVMEM session disk cache requires supported session switching (flash attention on)\n");
++                    return false;
++                }
++                LOG_WRN("srv    KVMEM --kvmem-conversations %d unavailable in this configuration; "
++                        "using one host store\n", options.conversations);
++            } else {
++                st.conv_limits.max_stores = options.conversations;
++                st.conv_limits.max_bytes = options.conversation_bytes;
++                if (options.session_disk_bytes || options.payload_disk_bytes) {
++                    try {
++                        st.session_files = std::make_unique<kvmem_session_files>(
++                            std::filesystem::u8path(options.payload_disk_bytes ? options.payload_disk_dir : options.session_cache_dir),
++                            options.payload_disk_bytes ? options.payload_disk_bytes : options.session_disk_bytes,
++                            [](bool warning, const std::string & message) {
++                                if (warning) { LOG_WRN("srv    KVMEM session cache %s\n", message.c_str()); }
++                                else { LOG_INF("srv    KVMEM session cache %s\n", message.c_str()); }
++                            }, kvmem_execution_spill_file(st.execution.get()));
++                    } catch (const std::exception & e) {
++                        LOG_ERR("srv    KVMEM session cache initialization failed: %s\n", e.what()); return false;
++                    }
++                    LOG_INF("srv    KVMEM session disk cache=%s quota=%llu bytes\n", st.session_files->directory().u8string().c_str(),
++                        (unsigned long long)st.session_files->limit());
++                }
++                st.conv_active = st.conv_table.add(llama_kvmem_store_current());
++                st.conv.emplace(st.conv_active, kvmem_conversation{});
++                st.conv_table.touch(st.conv_active, ++st.conv_clock);
++                llama_driver_publish_conversations(st);
++                LOG_INF("srv    KVMEM conversations=%d host_bytes_max=%llu\n",
++                        options.conversations, (unsigned long long) st.conv_limits.max_bytes);
++                // Every host store builds its own runtime, so the pinned arena
++                // --kvmem-cpu-gb sizes and the tier --kvmem-nvme-gb sizes are
++                // allocated once per store, not once per process. The server owns
++                // the conversation caps and the adapter is never told the store
++                // count, so say what those two numbers now mean rather than
++                // quietly dividing them.
++                if (st.kparams.cpu_bytes || st.kparams.nvme_bytes) {
++                    const double gib = 1024.0 * 1024.0 * 1024.0;
++                    LOG_WRN("srv    KVMEM --kvmem-cpu-gb and --kvmem-nvme-gb are per host store: "
++                            "%d stores commit up to %.1f GiB pinned (allocated and zero-filled as "
++                            "stores are created) and overcommit %.1f GiB NVMe (sparse, unlinked)\n",
++                            options.conversations,
++                            options.conversations * (double) st.kparams.cpu_bytes / gib,
++                            options.conversations * (double) st.kparams.nvme_bytes / gib);
+                 }
+-                LOG_INF("srv    KVMEM session disk cache=%s quota=%llu bytes\n", st.session_files->directory().u8string().c_str(),
+-                    (unsigned long long)st.session_files->limit());
+-            }
+-            st.conv_active = st.conv_table.add(llama_kvmem_store_current());
+-            st.conv.emplace(st.conv_active, kvmem_conversation{});
+-            st.conv_table.touch(st.conv_active, ++st.conv_clock);
+-            llama_driver_publish_conversations(st);
+-            LOG_INF("srv    KVMEM conversations=%d host_bytes_max=%llu\n",
+-                    options.conversations, (unsigned long long) st.conv_limits.max_bytes);
+-            // Every host store builds its own runtime, so the pinned arena
+-            // --kvmem-cpu-gb sizes and the tier --kvmem-nvme-gb sizes are
+-            // allocated once per store, not once per process. The server owns
+-            // the conversation caps and the adapter is never told the store
+-            // count, so say what those two numbers now mean rather than
+-            // quietly dividing them.
+-            if (st.kparams.cpu_bytes || st.kparams.nvme_bytes) {
+-                const double gib = 1024.0 * 1024.0 * 1024.0;
+-                LOG_WRN("srv    KVMEM --kvmem-cpu-gb and --kvmem-nvme-gb are per host store: "
+-                        "%d stores commit up to %.1f GiB pinned (allocated and zero-filled as "
+-                        "stores are created) and overcommit %.1f GiB NVMe (sparse, unlinked)\n",
+-                        options.conversations,
+-                        options.conversations * (double) st.kparams.cpu_bytes / gib,
+-                        options.conversations * (double) st.kparams.nvme_bytes / gib);
+             }
+         }
++        preparation_templates = common_chat_templates_init(st.model, chat_template);
++        return true;
++    };
++
++    // Free everything load_runtime() built, so an idle server returns its VRAM.
++    // Order matters: the contexts die first (their KVMem adapters hold the host
++    // store handles), the model last. The multi-conversation stores and their
++    // disk snapshots are dropped rather than left dangling - a wake rebuilds the
++    // whole runtime from scratch, so the next request starts cold.
++    unload_runtime = [&]() {
++        for (auto * lane : lanes) {
++            kvmem_execution_scope scope(lane->execution.get());
++            // Canonical reset while the context is still alive: it clears the
++            // retrieval/generation caches, the multimodal checkpoints and the
++            // recurrent carries through llama_get_memory(), so nothing stale can
++            // be replayed into the rebuilt context after a wake.
++            if (lane->ctx) llama_driver_clear(*lane);
++            lane->active_prompt.reset();
++            lane->mm_rollback_prompt.reset();
++            lane->vision.reset();
++            kvmem_spec_stop(lane->spec);
++            if (lane->ctx) {
++                llama_free(lane->ctx);
++                lane->ctx = nullptr;
++            }
++            lane->tmpls.reset();
++            lane->model = nullptr;
++            lane->vocab = nullptr;
++        }
++        preparation_templates.reset();
++        shared_model.reset();
++        st.model = nullptr;
++        st.vocab = nullptr;
++        // The conversation bookkeeping references adapter state that died with
++        // the context: drop it instead of leaving dangling handles. A wake
++        // rebuilds the runtime from scratch, so the next request starts cold.
++        for (auto * lane : lanes) {
++            lane->conv.clear();
++            lane->conv_table = kvmem_store_table{};
++            lane->conv_active = -1;
++            lane->conv_limits = kvmem_store_limits{};
++            lane->session_files.reset();
++        }
++    };
++
++    if (!load_runtime()) return 1;
++
++    // ---- idle sleep (Dirk feature: --sleep-idle-seconds) --------------------
++    // After N seconds without a request the runtime is unloaded (VRAM back to
++    // the driver); the next request reloads it. The lane pool is not rebuilt on
++    // wake, so the feature is restricted to a single lane.
++    const int sleep_idle_seconds = options.sleep_idle_seconds;
++    if (sleep_idle_seconds > 0 && options.parallel != 1) {
++        fprintf(stderr, "KVMEM_STARTUP_ERROR --sleep-idle-seconds requires --parallel 1 "
++                        "(lane contexts are not rebuilt on wake)\n");
++        return 1;
+     }
++    std::mutex sleep_mu;
++    std::atomic<bool> sleeping{false};
++    std::atomic<int> requests_in_flight{0};
++    std::atomic<int64_t> last_activity{(int64_t) std::time(nullptr)};
++
++    // Other CUDA processes (the 8B/vision servers, ComfyUI) keep their VRAM
++    // until their own idle timers fire, so a wake retries for up to 60 s.
++    auto wake_runtime = [&]() -> bool {
++        const std::time_t deadline = std::time(nullptr) + 60;
++        for (;;) {
++            // A failed attempt can leave a half-built runtime behind (model
++            // loaded, context not). Free it before retrying, or the next
++            // attempt cannot allocate.
++            unload_runtime();
++            if (load_runtime()) {
++                sleeping.store(false);
++                return true;
++            }
++            if (std::time(nullptr) >= deadline) return false;
++            std::this_thread::sleep_for(std::chrono::seconds(5));
++        }
++    };
++
++    // The request path takes sleep_mu, counts itself in and stamps the activity;
++    // this guard only releases the count on every exit path.
++    struct activity_guard {
++        std::atomic<int> & counter;
++        std::atomic<int64_t> & stamp;
++        activity_guard(std::atomic<int> & c, std::atomic<int64_t> & s) : counter(c), stamp(s) {}
++        ~activity_guard() {
++            counter.fetch_sub(1);
++            stamp.store((int64_t) std::time(nullptr));
++        }
++    };
+ 
+     std::unique_ptr<kvmem_lane_conversations> lane_conversations;
+     if (options.parallel > 1) {
+@@ -1507,7 +1615,28 @@ int main(int argc, char ** argv) {
+         LOG_INF("srv    KVMEM global conversations=%d lanes=%d cpu_budget_per_store=%llu\n",
+                 options.conversations, options.parallel, (unsigned long long)st.kparams.cpu_bytes);
+     }
+-    auto preparation_templates = common_chat_templates_init(st.model, chat_template);
++    // Idle monitor: unload the runtime after --sleep-idle-seconds without a
++    // request. Detached, and it only touches the runtime while no request is in
++    // flight and while holding sleep_mu (the wake path takes the same lock).
++    std::thread sleep_monitor;
++    if (sleep_idle_seconds > 0) {
++        sleep_monitor = std::thread([&]() {
++            for (;;) {
++                std::this_thread::sleep_for(std::chrono::seconds(1));
++                if (sleeping.load() || requests_in_flight.load() != 0) continue;
++                const int64_t idle = (int64_t) std::time(nullptr) - last_activity.load();
++                if (idle < sleep_idle_seconds) continue;
++                std::lock_guard<std::mutex> lock(sleep_mu);
++                if (sleeping.load() || requests_in_flight.load() != 0) continue;
++                LOG_INF("srv    idle for %lld ms >= %d s: unloading model to free VRAM\n",
++                        (long long) idle * 1000, sleep_idle_seconds);
++                unload_runtime();
++                sleeping.store(true);
++                LOG_INF("srv    sleep: dropped conversation store(s); next request starts cold\n");
++            }
++        });
++        sleep_monitor.detach();
++    }
+     std::mutex preparation_templates_mutex;
+     httplib::Server svr;
+     svr.set_read_timeout(options.timeout, 0);
+@@ -1733,6 +1862,24 @@ int main(int argc, char ** argv) {
+     };
+ 
+     auto handle_chat = [&](const httplib::Request & req, httplib::Response & res) {
++        // A sleeping server rebuilds its runtime here, before anything touches
++        // st.ctx/st.vision. The retry window covers other CUDA processes that
++        // still hold VRAM while their own idle timers run.
++        {
++            // The idle monitor unloads while holding sleep_mu, so the request has
++            // to regain that lock - and count itself in - before it touches any
++            // runtime state. Without this an arriving request could read
++            // st.ctx/st.vision while the monitor is freeing them.
++            std::lock_guard<std::mutex> lock(sleep_mu);
++            if (sleep_idle_seconds > 0 && sleeping.load() && !wake_runtime()) {
++                res.status = 503;
++                res.set_content("{\"error\":\"model reload failed after idle sleep\"}", "application/json");
++                return;
++            }
++            requests_in_flight.fetch_add(1);
++            last_activity.store((int64_t) std::time(nullptr));
++        }
++        activity_guard activity(requests_in_flight, last_activity);
+         const std::time_t created = std::time(nullptr);
+         // /v1/responses reuses this handler: convert the Responses request to
+         // Chat Completions first, then select the Responses output shape below.
